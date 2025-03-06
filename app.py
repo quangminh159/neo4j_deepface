@@ -1,54 +1,119 @@
-from flask import Flask, render_template, Response, request, redirect, url_for, flash
-import cv2
-from Capture_Image import takeImages  # Import từ file register.py
-from Train_Image import FaceTrainer  # Import từ file train.py
-from Recognize import FaceRecognizer  # Import từ file recognize.py
+from flask import Flask, request, jsonify, render_template
+import json
+import os
+from compare import FaceRecognitionApp
 
 app = Flask(__name__)
-app.secret_key = "your_secret_key"
-
-camera = cv2.VideoCapture(0)
-
-def generate_frames():
-    while True:
-        success, frame = camera.read()
-        if not success:
-            break
-        else:
-            _, buffer = cv2.imencode('.jpg', frame)
-            frame = buffer.tobytes()
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+face_app = FaceRecognitionApp(
+    neo4j_uri="bolt://localhost:7687",
+    neo4j_user="neo4j",
+    neo4j_pass="123456789"
+)
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
-@app.route('/video_feed')
-def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
 @app.route('/register', methods=['POST'])
 def register():
-    student_id = request.form['id']
-    name = request.form['name']
-    
-    takeImages(student_id, name)
+    try:
+        data = request.get_json()
+        id = data.get('id')
+        name = data.get('name')
+        image = data.get('image')
+       
+        if not id or not name or not image:
+            return jsonify({"status": "error", "message": "Thiếu thông tin"})
+       
+        image_paths = face_app.save_face_multi(id, name, image, num_captures=30)
+       
+        return jsonify({
+            "status": "success",
+            "message": f"Đã đăng ký khuôn mặt cho {name} với 30 ảnh",
+            "image_count": len(image_paths)
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
 
-    flash(f"✅ Student {name} (ID: {student_id}) registered successfully!")
-    return redirect(url_for('index'))
-
-@app.route('/train')
-def train():
-    FaceTrainer()  
-    flash("✅ Training model completed successfully!")
-    return redirect(url_for('index'))
-
-@app.route('/recognize')
+@app.route('/recognize', methods=['POST'])
 def recognize():
-    FaceRecognizer()  
-    flash("✅ Face recognition started!")
-    return redirect(url_for('index'))
+    try:
+        data = request.get_json()
+        image = data.get('image')
+       
+        if not image:
+            return jsonify({"status": "error", "message": "Thiếu ảnh"})
+       
+        matches = face_app.recognize_face(image)
+        sorted_matches = sorted(matches, key=lambda x: x['similarity'], reverse=True)
+        best_matches_by_id = {}
+        for match in sorted_matches:
+            if match['id'] not in best_matches_by_id or match['similarity'] > best_matches_by_id[match['id']]['similarity']:
+                best_matches_by_id[match['id']] = match
+
+        best_matches = list(best_matches_by_id.values())
+        best_matches = sorted(best_matches, key=lambda x: x['similarity'], reverse=True)[:3]
+       
+        return jsonify({
+            "status": "success",
+            "matches": best_matches
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route('/list', methods=['GET'])
+def list_persons():
+    try:
+        persons = face_app.get_person_list()
+        return jsonify({
+            "status": "success",
+            "persons": persons
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route('/persons', methods=['GET'])
+def get_persons():
+    try:
+        persons = face_app.get_persons_with_image_count()
+        return jsonify({
+            "status": "success",
+            "persons": persons
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
+@app.route('/delete', methods=['POST'])
+def delete_person():
+    try:
+        data = request.get_json()
+        person_id = data.get('id')
+        name = data.get('name')
+
+        if not person_id and not name:
+            return jsonify({"status": "error", "message": "Thiếu ID hoặc tên người dùng"})
+
+        if not person_id:
+            persons = face_app.get_person_list()
+            matched_person = next((p for p in persons if p['name'] == name), None)
+            if matched_person:
+                person_id = matched_person['id']
+            else:
+                return jsonify({"status": "error", "message": f"Không tìm thấy người dùng với tên {name}"})
+
+        if face_app.delete_person(person_id):
+            return jsonify({"status": "success", "message": f"Đã xóa người dùng {person_id}"})
+        else:
+            return jsonify({"status": "error", "message": "Không thể xóa người dùng"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)})
+
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    try:
+        os.makedirs('static', exist_ok=True)
+        os.makedirs('templates', exist_ok=True)
+       
+        app.run(host="0.0.0.0", port=5001, debug=True)
+    finally:
+        face_app.close()
